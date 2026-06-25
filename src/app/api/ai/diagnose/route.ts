@@ -3,7 +3,14 @@
 // 이렇게 해야 API 비용을 대폭 절감할 수 있음
 import { NextRequest, NextResponse } from "next/server";
 import { createServerSupabase } from "@/lib/supabase/server";
-import { generateDiagnosis } from "@/lib/claude";
+import { diagnosisStream } from "@/lib/claude";
+
+// 캐시 히트 텍스트를 스트림처럼 즉시 반환
+function textResponse(text: string) {
+  return new Response(text, {
+    headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" },
+  });
+}
 
 interface OptionRow {
   id: string;
@@ -33,18 +40,22 @@ export async function POST(request: NextRequest) {
 
   const { questionId, selectedOptionId } = await request.json();
 
-  // 1. 문제 + 보기 정보 가져오기
-  const { data: question } = await supabase
-    .from("questions")
-    .select(
-      `
-      body,
-      options:question_options(id, text, is_correct)
-    `
-    )
-    .eq("id", questionId)
-    .single();
+  // 1. 문제+보기, 오개념 매핑을 병렬 조회 (순차 → 병렬로 지연 단축)
+  const [questionRes, mapRes] = await Promise.all([
+    supabase
+      .from("questions")
+      .select(`body, options:question_options(id, text, is_correct)`)
+      .eq("id", questionId)
+      .single(),
+    supabase
+      .from("option_misconception_map")
+      .select("misconception_id, misconception:misconceptions(id, name)")
+      .eq("option_id", selectedOptionId)
+      .limit(1)
+      .maybeSingle(),
+  ]);
 
+  const question = questionRes.data;
   if (!question) {
     return NextResponse.json(
       { error: "문제를 찾을 수 없습니다." },
@@ -63,40 +74,31 @@ export async function POST(request: NextRequest) {
     );
   }
 
-  // 2. 이 오답 보기에 연결된 오개념이 있는지 확인
-  const { data: misconceptionMap } = await supabase
-    .from("option_misconception_map")
-    .select("misconception_id, misconception:misconceptions(id, name)")
-    .eq("option_id", selectedOptionId)
-    .limit(1)
-    .maybeSingle();
-
+  const misconceptionMap = mapRes.data;
   const misconception = misconceptionMap?.misconception as
     | { id: string; name: string }
     | undefined;
+  const misconceptionId = misconceptionMap?.misconception_id as
+    | string
+    | undefined;
 
-  // 3. ⭐ 캐시 확인: 이 오개념에 대한 진단이 이미 있는지
-  if (misconceptionMap?.misconception_id) {
+  // 2. ⭐ 캐시 확인: 이 오개념에 대한 진단이 이미 있으면 즉시 반환 (0초)
+  if (misconceptionId) {
     const { data: cached } = await supabase
       .from("ai_diagnoses")
       .select("diagnosis_text")
-      .eq("misconception_id", misconceptionMap.misconception_id)
+      .eq("misconception_id", misconceptionId)
       .maybeSingle();
 
-    if (cached) {
-      // 캐시 히트! → API 비용 0원 💰
-      return NextResponse.json({
-        diagnosis: cached.diagnosis_text,
-        misconception,
-        cached: true,
-      });
+    if (cached?.diagnosis_text) {
+      return textResponse(cached.diagnosis_text);
     }
   }
 
-  // 4. 캐시 미스 → Claude API 호출
-  let diagnosisText: string;
+  // 3. 캐시 미스 → Claude 스트리밍 호출 (토큰을 받는 즉시 흘려보냄)
+  let stream;
   try {
-    diagnosisText = await generateDiagnosis(
+    stream = diagnosisStream(
       question.body,
       correctOption.text,
       selectedOption.text,
@@ -110,20 +112,36 @@ export async function POST(request: NextRequest) {
     );
   }
 
-  // 5. 결과를 캐시에 저장 (다음 사람은 무료로 받음)
-  if (misconceptionMap?.misconception_id) {
-    await supabase.from("ai_diagnoses").upsert(
-      {
-        misconception_id: misconceptionMap.misconception_id,
-        diagnosis_text: diagnosisText,
-      },
-      { onConflict: "misconception_id" }
-    );
-  }
+  const encoder = new TextEncoder();
+  let full = "";
+  const readable = new ReadableStream({
+    async start(controller) {
+      try {
+        for await (const event of stream) {
+          if (
+            event.type === "content_block_delta" &&
+            event.delta.type === "text_delta"
+          ) {
+            full += event.delta.text;
+            controller.enqueue(encoder.encode(event.delta.text));
+          }
+        }
+        // 스트림 종료 후 캐시에 저장 (다음 사람은 0초로 받음)
+        if (misconceptionId && full) {
+          await supabase.from("ai_diagnoses").upsert(
+            { misconception_id: misconceptionId, diagnosis_text: full },
+            { onConflict: "misconception_id" }
+          );
+        }
+        controller.close();
+      } catch (err) {
+        console.error("[ai/diagnose] 스트리밍 실패:", err);
+        controller.error(err);
+      }
+    },
+  });
 
-  return NextResponse.json({
-    diagnosis: diagnosisText,
-    misconception: misconception || null,
-    cached: false,
+  return new Response(readable, {
+    headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" },
   });
 }

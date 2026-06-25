@@ -15,6 +15,7 @@ export default function AiDiagnosis({ questionId, selectedOptionId }: Props) {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
+    let cancelled = false;
     const fetchDiagnosis = async () => {
       try {
         const res = await fetch("/api/ai/diagnose", {
@@ -23,18 +24,39 @@ export default function AiDiagnosis({ questionId, selectedOptionId }: Props) {
           body: JSON.stringify({ questionId, selectedOptionId }),
         });
         if (!res.ok) {
-          const data = await res.json();
+          const data = await res.json().catch(() => ({}));
           throw new Error(data.error || "AI 진단 실패");
         }
-        const data = await res.json();
-        setDiagnosis(data.diagnosis);
+
+        // 스트리밍 응답을 받는 즉시 화면에 출력
+        const reader = res.body?.getReader();
+        if (!reader) {
+          const text = await res.text();
+          if (!cancelled) setDiagnosis(text);
+          return;
+        }
+        const decoder = new TextDecoder();
+        let acc = "";
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          acc += decoder.decode(value, { stream: true });
+          if (!cancelled) {
+            setDiagnosis(acc);
+            setLoading(false); // 첫 글자가 도착하면 로딩 해제 → 즉시 출력
+          }
+        }
       } catch (err) {
-        setError(err instanceof Error ? err.message : "AI 진단 실패");
+        if (!cancelled)
+          setError(err instanceof Error ? err.message : "AI 진단 실패");
       } finally {
-        setLoading(false);
+        if (!cancelled) setLoading(false);
       }
     };
     fetchDiagnosis();
+    return () => {
+      cancelled = true;
+    };
   }, [questionId, selectedOptionId]);
 
   if (loading) {
