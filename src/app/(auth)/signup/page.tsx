@@ -38,11 +38,16 @@ function SignupForm() {
   const supabase = createClient();
 
   // 초대 링크(/signup?code=ABC-123)로 진입 시 코드 자동 입력
+  // 학원용 링크(/signup?mode=academy)로 진입 시 학원 탭 자동 선택
   useEffect(() => {
     const code = searchParams.get("code");
     if (code) {
       setInviteCode(code);
       setMode("individual");
+      return;
+    }
+    if (searchParams.get("mode") === "academy") {
+      setMode("academy");
     }
   }, [searchParams]);
 
